@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"regexp"
 
 	"github.com/containers/image/docker/reference"
 	"github.com/containers/image/image"
@@ -39,25 +41,70 @@ func (i *Image) SourceRefFullName() string {
 	return i.src.ref.ref.Name()
 }
 
-// GetRepositoryTags list all tags available in the repository. Note that this has no connection with the tag(s) used for this specific image, if any.
-func (i *Image) GetRepositoryTags() ([]string, error) {
-	path := fmt.Sprintf(tagsPath, reference.Path(i.src.ref.ref))
-	// FIXME: Pass the context.Context
-	res, err := i.src.c.makeRequest(context.TODO(), "GET", path, nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		// print url also
-		return nil, errors.Errorf("Invalid status code returned when fetching tags list %d", res.StatusCode)
-	}
+// MakeRepositoryTagsRequest make a single request to get tag listing given an input path.  Pagination is handled in the GetRepositoryTags outer function.
+func MakeRepositoryTagsRequest(i *Image, path string) ([]string, []string, error) {
 	type tagsRes struct {
 		Tags []string
 	}
 	tags := &tagsRes{}
-	if err := json.NewDecoder(res.Body).Decode(tags); err != nil {
-		return nil, err
+
+	// FIXME: Pass the context.Context
+	res, err := i.src.c.makeRequest(context.TODO(), "GET", path, nil, nil)
+	if err != nil {
+		return nil, nil, err
 	}
-	return tags.Tags, nil
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		// print url also
+		return nil, nil, errors.Errorf("Invalid status code returned when fetching tags list %d", res.StatusCode)
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(tags); err != nil {
+		return nil, nil, err
+	}
+
+	linkValue := (res.Header)["Link"]
+
+	return tags.Tags, linkValue, nil
+}
+
+// GetRepositoryTags list all tags available in the repository. Note that this has no connection with the tag(s) used for this specific image, if any.
+func (i *Image) GetRepositoryTags() ([]string, error) {
+	var result []string
+
+	done := false
+	nextLinkRegexp := regexp.MustCompile(`\A<(.+)>;(.+)\z`)
+
+	path := fmt.Sprintf(tagsPath, reference.Path(i.src.ref.ref))
+
+	for !done {
+		tags, linkValue, err := MakeRepositoryTagsRequest(i, path)
+		if tags == nil {
+			return nil, err
+		}
+
+		result = append(result, tags...)
+
+		if len(linkValue) < 1 {
+			// no Link header found indicating pagination is done
+			done = true
+		} else {
+			// got a Link header in response, indicating pagination is enabled - parse the path and continue
+
+			match := nextLinkRegexp.FindStringSubmatch(linkValue[0])
+			if match != nil {
+				u, uerr := url.Parse(match[1])
+				if uerr != nil {
+					return nil, uerr
+				} else {
+					path = fmt.Sprintf("%s?%s", u.Path, u.RawQuery)
+				}
+			} else {
+				return nil, errors.Errorf("Could not parse link header in response when fetching tags list")
+			}
+		}
+
+	}
+
+	return result, nil
 }
